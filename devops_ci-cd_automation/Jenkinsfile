@@ -1,0 +1,98 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME       = "myregistry/myapp"
+        IMAGE_TAG        = "${env.GIT_COMMIT}"
+        REGISTRY_CRED    = credentials('docker-registry-creds')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+            }
+        }
+
+        stage('Test') {
+            steps { 
+                sh 'mvn test' 
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                sh """
+                    echo "${REGISTRY_CRED_PSW}" | \
+                    docker login -u "${REGISTRY_CRED_USR}" --password-stdin
+                    docker push "${IMAGE_NAME}:${IMAGE_TAG}"
+                """
+            }
+        }
+
+        stage('Deploy to Dev') {
+            when { branch 'dev' }
+            steps {
+                sh """
+                    terraform init
+                    terraform apply -auto-approve \
+                        -var="image_tag=${IMAGE_TAG}" \
+                        -var="env=dev"
+                """
+            }
+        }
+
+        stage('Deploy to Prod') {
+            when { branch 'main' }
+            input {
+                message "Deploy to Production?"
+                ok "Yes, deploy"
+            }
+            steps {
+                sh """
+                    terraform init
+                    terraform apply -auto-approve \
+                        -var="image_tag=${IMAGE_TAG}" \
+                        -var="env=prod"
+                """
+            }
+        }
+
+        stage('Verify & Rollback if Failed') {
+            when { branch 'main' }
+            steps {
+                script {
+                    def status = sh(
+                        script: "kubectl rollout status deployment/sample-app --timeout=120s",
+                        returnStatus: true
+                    )
+                    if (status != 0) {
+                        sh "kubectl rollout undo deployment/sample-app"
+                        error("Deployment unhealthy — rolling back to previous version")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline succeeded — ${IMAGE_NAME}:${IMAGE_TAG} deployed"
+        }
+        failure {
+            echo "Pipeline failed — check logs"
+        }
+        always {
+            sh 'docker logout'
+            cleanWs()
+        }
+    }
+}
